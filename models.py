@@ -2,7 +2,7 @@ import tensorflow as tf
 from tensorflow import keras
 
 
-from modules import BLSTMlayer
+from modules import BLSTMlayer, CBHG, FrameProjection, MaskedMSE, MaskedLinearLoss
 
 
 class DNNClassifier(object):
@@ -90,7 +90,7 @@ class CnnDnnClassifier(object):
                 'cross_entropy': cross_entropy}
 
 
-class CNNBLSTMCalssifier(object):#使用这个
+class CNNBLSTMCalssifier(object):
     def __init__(self, out_dims, n_cnn, cnn_hidden,
                  cnn_kernel, n_blstm, lstm_hidden,
                  name='cnn_blstm_classifier'):
@@ -131,3 +131,62 @@ class CNNBLSTMCalssifier(object):#使用这个
         cross_entropy = tf.reduce_mean(cross_entropy * mask) if cross_entropy is not None else None
         return {'logits': logits,  # [time, dims]
                 'cross_entropy': cross_entropy}
+
+class AcousticCBHGRegression(object):#使用这个
+    def __init__(self, hp,
+                 name='acoustic_CBHG_regression'):
+        self.name = name
+        self.hp = hp
+        with tf.variable_scope(self.name):
+            # Add post-processing CBHG. This does a great job at extracting features from mels before projection to Linear specs.
+            self.post_cbhg = CBHG(hp.cbhg_kernels, hp.cbhg_conv_channels, hp.cbhg_pool_size, [hp.cbhg_projection, hp.num_ppgs],
+                hp.cbhg_projection_kernel_size, hp.cbhg_highwaynet_layers,
+                hp.cbhg_highway_units, hp.cbhg_rnn_units, hp.batch_norm_position, hp.is_training, name='CBHG_postnet')
+
+            
+
+            #Linear projection of extracted features to make linear spectrogram
+            self.linear_specs_projection = FrameProjection(hp.num_freq, scope='cbhg_linear_specs_projection')
+            # self.cnn_layers = []
+            # for i in range(n_cnn):
+            #     conv_layer = keras.layers.Conv1D(filters=cnn_hidden,
+            #                                      kernel_size=cnn_kernel,
+            #                                      strides=1, padding='same',
+            #                                      activation=tf.nn.relu,
+            #                                      name='conv_layer{}'.format(i))
+            #     self.cnn_layers.append(conv_layer)
+            # self.blstm_layers = []
+            # for i in range(n_blstm):
+            #     blstm_layer = BLSTMlayer(lstm_hidden,
+            #                              name='blstm_layer{}'.format(i))
+            #     self.blstm_layers.append(blstm_layer)
+            # self.output_projection = keras.layers.Dense(units=out_dims)
+
+    def __call__(self, inputs, labels=None, lengths=None):
+        #[batch_size, decoder_steps(mel_frames), cbhg_channels]
+        post_outputs = self.post_cbhg(inputs, None)
+        #[batch_size, decoder_steps(linear_frames), num_freq]
+        linear_outputs = self.linear_specs_projection(post_outputs)
+
+        # # 1. CNN block
+        # cnn_outs = inputs
+        # for layer in self.cnn_layers:
+        #     cnn_outs = layer(cnn_outs)
+        # # 2. BLSTM layers
+        # blstm_outs = cnn_outs
+        # for layer in self.blstm_layers:
+        #     blstm_outs = layer(blstm_outs, seq_lens=lengths)
+        # # 3. output projection
+        # logits = self.output_projection(blstm_outs)
+
+        # 4. compute loss
+        # mse = tf.nn.sparse_softmax_cross_entropy_with_logits(
+        #     labels=tf.argmax(labels, axis=-1),
+        #     logits=logits) if labels is not None else None
+        # 并且在MaskedLinearLoss中，可能更好
+        # mse = MaskedMSE(labels, linear_outputs, lengths, self.hp) # 注意label和预测值顺序，注意lengths是1维浮点数
+        mae_weighted = MaskedLinearLoss(labels, linear_outputs, lengths, self.hp) # 注意label和预测值顺序，注意lengths是1维浮点数
+        # mask = tf.sequence_mask(lengths, dtype=tf.float32) if lengths is not None else 1.0
+        # cross_entropy = tf.reduce_mean(cross_entropy * mask) if cross_entropy is not None else None
+        return {'linears': linear_outputs,  # [time, dims]
+                'mae_weighted': mae_weighted}

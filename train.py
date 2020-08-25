@@ -10,23 +10,48 @@ import numpy as np
 
 os.environ["CUDA_VISIBLE_DEVICES"]="2"#2
 
-from models import CnnDnnClassifier, DNNClassifier, CNNBLSTMCalssifier
+# from models import CnnDnnClassifier, DNNClassifier, CNNBLSTMCalssifier
+from models import AcousticCBHGRegression
 from timit_dataset import train_generator, test_generator
+from audio import griffin_lim, write_wav
 #
 # some super parameters
 # BATCH_SIZE = 64
-BATCH_SIZE = 16
-STEPS = int(5e5)
+BATCH_SIZE = 64
+STEPS = int(8e4)
 LEARNING_RATE = 0.3
 STARTED_DATESTRING = "{0:%Y-%m-%dT%H-%M-%S}".format(datetime.now())
-MAX_TO_SAVE = 20
-CKPT_EVERY = 1000
-MFCC_DIM = 39
-PPG_DIM = 345
+MAX_TO_SAVE = 50
+CKPT_EVERY = 500
+# CKPT_EVERY = 5
+save_train_audio = 501
+# save_train_audio = 6
+# MFCC_DIM = 39
+# PPG_DIM = 345
 
-logdir = 'log_dir'
-model_dir = 'ckpt_model_dir'
-restore_dir = 'ckpt_model_dir'
+logdir = 'LJSpeech-1.1_log_dir'
+model_dir = 'LJSpeech-1.1_ckpt_model_dir'
+restore_dir = 'LJSpeech-1.1_ckpt_model_dir'
+
+
+ # 记得预测的时候，batch为1，把is_training关掉
+my_hp = tf.contrib.training.HParams(
+    #CBHG mel->linear postnet
+    cbhg_kernels = 8, #All kernel sizes from 1 to cbhg_kernels will be used in the convolution bank of CBHG to act as "K-grams"
+    cbhg_conv_channels = 128, #Channels of the convolution bank
+    cbhg_pool_size = 2, #pooling size of the CBHG
+    cbhg_projection = 256, #projection channels of the CBHG (1st projection, 2nd is automatically set to num_mels)
+    num_ppgs = 345,
+    cbhg_projection_kernel_size = 3, #kernel_size of the CBHG projections
+    cbhg_highwaynet_layers = 4, #Number of HighwayNet layers
+    cbhg_highway_units = 128, #Number of units used in HighwayNet fully connected layers
+    cbhg_rnn_units = 128, #Number of GRU units used in bidirectional RNN of CBHG block. CBHG output is 2x rnn_units in shape
+    outputs_per_step = 1,
+    batch_norm_position = 'after', #Can be in ('before', 'after'). Determines whether we use batch norm before or after the activation function (relu). Matter for debate.
+    is_training = 1,
+    num_freq = 201,
+    sample_rate = 16000,
+)
 
 
 def get_arguments():
@@ -133,11 +158,11 @@ def main():
                                                output_types=(
                                                    tf.float32, tf.float32, tf.int32),
                                                output_shapes=(
-                                                   [None, MFCC_DIM], [None, PPG_DIM], []))
+                                                   [None, my_hp.num_ppgs], [None, my_hp.num_freq], []))
     #padding train data(why?how?)
     train_set = train_set.padded_batch(args.batch_size,
-                                       padded_shapes=([None, MFCC_DIM],
-                                                      [None, PPG_DIM],
+                                       padded_shapes=([None, my_hp.num_ppgs],
+                                                      [None, my_hp.num_freq],
                                                       [])).repeat()
     # Any unknown dimensions  will be padded to the maximum size of that dimension in each batch.
 
@@ -147,12 +172,12 @@ def main():
                                               output_types=(
                                                   tf.float32, tf.float32, tf.int32),
                                               output_shapes=(
-                                                  [None, MFCC_DIM], [None, PPG_DIM], []))
+                                                  [None, my_hp.num_ppgs], [None, my_hp.num_freq], []))
 
     #设置repeat()，在get_next循环中，如果越界了就自动循环。不计上限
     test_set = test_set.padded_batch(args.batch_size,
-                                     padded_shapes=([None, MFCC_DIM],
-                                                    [None, PPG_DIM],
+                                     padded_shapes=([None, my_hp.num_ppgs],
+                                                    [None, my_hp.num_freq],
                                                     [])).repeat()
     test_iterator = test_set.make_initializable_iterator()
 
@@ -173,40 +198,39 @@ def main():
     #                               cnn_hidden=64, dense_hiddens=[256, 256, 256])
 
 
-    classifier = CNNBLSTMCalssifier(out_dims=PPG_DIM, n_cnn=3, cnn_hidden=256,
-                                    cnn_kernel=3, n_blstm=2, lstm_hidden=128)
+    decoderRegression = AcousticCBHGRegression(my_hp)
 
-    results_dict = classifier(batch_data[0], batch_data[1], batch_data[2])
+    results_dict = decoderRegression(batch_data[0], batch_data[1], batch_data[2])
     #inputs labels lengths
     #results_dict['logits']= np.zeros([10])
-    predicted = tf.nn.softmax(results_dict['logits'])
-    mask = tf.sequence_mask(batch_data[2], dtype=tf.float32)#batch[2]是（None,)，是每条数据的MFCC数目,需要这个的原因是会填充成最长的MFCC长度。mask的维度是(None,max(batch[2]))
+    predicted = results_dict['linears']
+    # mask = tf.sequence_mask(batch_data[2], dtype=tf.float32)#batch[2]是（None,)，是每条数据的MFCC数目,需要这个的原因是会填充成最长的MFCC长度。mask的维度是(None,max(batch[2]))
 
 
 
     #batch_data[2]是MFCC数组的长度，MFCC有多少是不一定的。
-    accuracy = tf.reduce_sum(
-        tf.cast(#bool转float
-            tf.equal(tf.argmax(predicted, axis=-1),#比较每一行的最大元素
-                     tf.argmax(batch_data[1], axis=-1)),
-            tf.float32) * mask#乘上mask，是因为所有数据都被填充为最多mfcc的维度了。所以填充部分一定都是相等的，于是需要将其mask掉。
-    ) / tf.reduce_sum(tf.cast(batch_data[2], dtype=tf.float32))
+    # accuracy = tf.reduce_sum(
+    #     tf.cast(#bool转float
+    #         tf.equal(tf.argmax(predicted, axis=-1),#比较每一行的最大元素
+    #                  tf.argmax(batch_data[1], axis=-1)),
+    #         tf.float32) * mask#乘上mask，是因为所有数据都被填充为最多mfcc的维度了。所以填充部分一定都是相等的，于是需要将其mask掉。
+    # ) / tf.reduce_sum(tf.cast(batch_data[2], dtype=tf.float32))
 
-    tf.summary.scalar('accuracy', accuracy)
-    tf.summary.image('predicted',
+    # tf.summary.scalar('accuracy', accuracy)
+    tf.summary.image('predicted_linear',
                      tf.expand_dims(
                          tf.transpose(predicted, [0, 2, 1]),
                          axis=-1), max_outputs=1)
-    tf.summary.image('groundtruth',
+    tf.summary.image('groundtruth_linear',
                      tf.expand_dims(
                          tf.cast(
                              tf.transpose(batch_data[1], [0, 2, 1]),
                              tf.float32),
                          axis=-1), max_outputs=1)
 
-    loss = results_dict['cross_entropy']
+    loss = results_dict['mae_weighted']
     learning_rate_pl = tf.placeholder(tf.float32, None, 'learning_rate')
-    tf.summary.scalar('cross_entropy', loss)
+    tf.summary.scalar('mae_weighted_loss', loss)
     tf.summary.scalar('learning_rate', learning_rate_pl)
     optimizer = tf.train.AdadeltaOptimizer(learning_rate=learning_rate_pl)
     optim = optimizer.minimize(loss)
@@ -245,17 +269,19 @@ def main():
     step = None
     try:
         for step in range(saved_global_step + 1, args.steps):
-            if step <= int(4e5):
+            if step <= int(1e3):
                 lr = args.lr
-            elif step <= int(6e5):
+            elif step <= int(2e3):
+                lr = 0.8 * args.lr
+            elif step <= int(4e3):
                 lr = 0.5 * args.lr
-            elif step <= int(8e5):
+            elif step <= int(8e3):
                 lr = 0.25 * args.lr
             else:
                 lr = 0.125 * args.lr
             start_time = time.time()
             if step % args.ckpt_every == 0:
-                summary, loss_value = sess.run([summaries, loss],
+                summary, loss_value, mag_spec, label_spec= sess.run([summaries, loss, predicted, batch_data[1]],
                                                feed_dict={dataset_handle: test_handle,
                                                           learning_rate_pl: lr})
                 dev_writer.add_summary(summary, step)
@@ -264,8 +290,15 @@ def main():
                       .format(step, loss_value, duration))
                 save_model(saver, sess, model_dir, step)
                 last_saved_step = step
+                # 没有提取mask，先听听试试
+                y = griffin_lim(mag_spec[0])
+                dev_path = os.path.join(dev_dir, 'dev' + str(step) + '.wav')
+                write_wav(dev_path, y, sr=16000)
+                y = griffin_lim(label_spec[0])
+                dev_path = os.path.join(dev_dir, 'groundtruth_dev' + str(step) + '.wav')
+                write_wav(dev_path, y, sr=16000)
             else:
-                summary, loss_value, _ = sess.run([summaries, loss, optim],
+                summary, loss_value, _, mag_spec, label_spec = sess.run([summaries, loss, optim, predicted, batch_data[1]],
                                                   feed_dict={dataset_handle: train_handle,
                                                              learning_rate_pl: lr})
                 train_writer.add_summary(summary, step)
@@ -273,6 +306,15 @@ def main():
                     duration = time.time() - start_time
                     print('step {:d} - training loss = {:.3f}, ({:.3f} sec/step)'
                           .format(step, loss_value, duration))
+                if step % save_train_audio == 0:
+                    # 没有提取mask，先听听试试
+                    y = griffin_lim(mag_spec[0])
+                    train_path = os.path.join(train_dir, 'train' + str(step) + '.wav')
+                    write_wav(train_path, y, sr=16000)
+                    y = griffin_lim(label_spec[0])
+                    trian_path = os.path.join(train_dir, 'groundtruth_train' + str(step) + '.wav')
+                    write_wav(trian_path, y, sr=16000)
+
     except KeyboardInterrupt:
         # Introduce a line break after ^C is displayed so save message
         # is on its own line.
