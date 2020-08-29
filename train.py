@@ -11,15 +11,15 @@ import numpy as np
 os.environ["CUDA_VISIBLE_DEVICES"]="2"#2
 
 # from models import CnnDnnClassifier, DNNClassifier, CNNBLSTMCalssifier
-from models import AcousticCBHGRegression
+from models import ConversionModelV3
 from timit_dataset import train_generator, test_generator
-from audio import griffin_lim, write_wav
+from audio import log_power_denormalize, db2power, griffin_lim, write_wav 
 #
 # some super parameters
 # BATCH_SIZE = 64
-BATCH_SIZE = 64
-STEPS = int(8e4)
-LEARNING_RATE = 0.3
+BATCH_SIZE = 16
+STEPS = int(1e5)
+LEARNING_RATE = 1e-3
 STARTED_DATESTRING = "{0:%Y-%m-%dT%H-%M-%S}".format(datetime.now())
 MAX_TO_SAVE = 50
 CKPT_EVERY = 500
@@ -28,27 +28,38 @@ save_train_audio = 501
 # save_train_audio = 6
 # MFCC_DIM = 39
 # PPG_DIM = 345
+# PPG_DIM = 345
+# STFT_DIM = 201
+# NUM_MEL = 80
+DROP_RATE = 0.5
 
 logdir = 'LJSpeech-1.1_log_dir'
 model_dir = 'LJSpeech-1.1_ckpt_model_dir'
 restore_dir = 'LJSpeech-1.1_ckpt_model_dir'
 
 
+def normSTFT2wav(spec):
+    denormalized = log_power_denormalize(spec)
+    mag_spec = db2power(denormalized) ** 0.5
+    wav = griffin_lim(mag_spec)
+    return wav
+
+
  # 记得预测的时候，batch为1，把is_training关掉
 my_hp = tf.contrib.training.HParams(
     #CBHG mel->linear postnet
-    cbhg_kernels = 8, #All kernel sizes from 1 to cbhg_kernels will be used in the convolution bank of CBHG to act as "K-grams"
-    cbhg_conv_channels = 128, #Channels of the convolution bank
-    cbhg_pool_size = 2, #pooling size of the CBHG
-    cbhg_projection = 256, #projection channels of the CBHG (1st projection, 2nd is automatically set to num_mels)
+    # cbhg_kernels = 8, #All kernel sizes from 1 to cbhg_kernels will be used in the convolution bank of CBHG to act as "K-grams"
+    # cbhg_conv_channels = 128, #Channels of the convolution bank
+    # cbhg_pool_size = 2, #pooling size of the CBHG
+    # cbhg_projection = 256, #projection channels of the CBHG (1st projection, 2nd is automatically set to num_mels)
     num_ppgs = 345,
-    cbhg_projection_kernel_size = 3, #kernel_size of the CBHG projections
-    cbhg_highwaynet_layers = 4, #Number of HighwayNet layers
-    cbhg_highway_units = 128, #Number of units used in HighwayNet fully connected layers
-    cbhg_rnn_units = 128, #Number of GRU units used in bidirectional RNN of CBHG block. CBHG output is 2x rnn_units in shape
-    outputs_per_step = 1,
-    batch_norm_position = 'after', #Can be in ('before', 'after'). Determines whether we use batch norm before or after the activation function (relu). Matter for debate.
-    is_training = 1,
+    # cbhg_projection_kernel_size = 3, #kernel_size of the CBHG projections
+    # cbhg_highwaynet_layers = 4, #Number of HighwayNet layers
+    # cbhg_highway_units = 128, #Number of units used in HighwayNet fully connected layers
+    # cbhg_rnn_units = 128, #Number of GRU units used in bidirectional RNN of CBHG block. CBHG output is 2x rnn_units in shape
+    # outputs_per_step = 1,
+    # batch_norm_position = 'after', #Can be in ('before', 'after'). Determines whether we use batch norm before or after the activation function (relu). Matter for debate.
+    # is_training = 1,
     num_freq = 201,
     sample_rate = 16000,
 )
@@ -83,7 +94,7 @@ def get_arguments():
 
 
 def save_model(saver, sess, logdir, step):
-    model_name = 'vqvae.ckpt'
+    model_name = 'linear_decoder.ckpt'
     ckpt_path = os.path.join(logdir, model_name)
     print('Storing checkpoint to {} ...'.format(logdir), end="")
     sys.stdout.flush()
@@ -114,27 +125,27 @@ def load_model(saver, sess, logdir):
         return None
 
 
-def get_default_logdir(logdir_root, mode='train'):
-    logdir = os.path.join(logdir_root, mode, STARTED_DATESTRING)
-    return logdir
+# def get_default_logdir(logdir_root, mode='train'):
+#     logdir = os.path.join(logdir_root, mode, STARTED_DATESTRING)
+#     return logdir
 
 
-def validate_directories(restore_dir, overwrite):
-    if restore_dir is None:
-        logdir = get_default_logdir('./logdir')
-        dev_dir = get_default_logdir('./logdir', 'dev')
-        restore_dir = logdir
-        os.makedirs(logdir)
-    elif overwrite:
-        logdir = restore_dir
-        dev_dir = restore_dir.replace('train', 'dev')
-        if not os.path.isdir(logdir):
-            raise ValueError('No such directory: {}'.format(restore_dir))
-    else:
-        logdir = get_default_logdir('./logdir')
-        dev_dir = get_default_logdir('./logdir', 'dev')
-        os.makedirs(logdir)
-    return {'logdir': logdir, 'restore_from': restore_dir, 'dev_dir': dev_dir}
+# def validate_directories(restore_dir, overwrite):
+#     if restore_dir is None:
+#         logdir = get_default_logdir('./logdir')
+#         dev_dir = get_default_logdir('./logdir', 'dev')
+#         restore_dir = logdir
+#         os.makedirs(logdir)
+#     elif overwrite:
+#         logdir = restore_dir
+#         dev_dir = restore_dir.replace('train', 'dev')
+#         if not os.path.isdir(logdir):
+#             raise ValueError('No such directory: {}'.format(restore_dir))
+#     else:
+#         logdir = get_default_logdir('./logdir')
+#         dev_dir = get_default_logdir('./logdir', 'dev')
+#         os.makedirs(logdir)
+#     return {'logdir': logdir, 'restore_from': restore_dir, 'dev_dir': dev_dir}
 
 
 def main():
@@ -198,12 +209,12 @@ def main():
     #                               cnn_hidden=64, dense_hiddens=[256, 256, 256])
 
 
-    decoderRegression = AcousticCBHGRegression(my_hp)
+    decoderRegression = ConversionModelV3(out_dim=my_hp.num_freq, drop_rate=DROP_RATE, is_train=True)
 
-    results_dict = decoderRegression(batch_data[0], batch_data[1], batch_data[2])
+    results_dict = decoderRegression(inputs=batch_data[0], targets=batch_data[1], lengths=batch_data[2])
     #inputs labels lengths
     #results_dict['logits']= np.zeros([10])
-    predicted = results_dict['linears']
+    predicted = results_dict['out']
     # mask = tf.sequence_mask(batch_data[2], dtype=tf.float32)#batch[2]是（None,)，是每条数据的MFCC数目,需要这个的原因是会填充成最长的MFCC长度。mask的维度是(None,max(batch[2]))
 
 
@@ -227,10 +238,16 @@ def main():
                              tf.transpose(batch_data[1], [0, 2, 1]),
                              tf.float32),
                          axis=-1), max_outputs=1)
+    tf.summary.image('groundtruth_PPG',
+                     tf.expand_dims(
+                         tf.cast(
+                             tf.transpose(batch_data[0], [0, 2, 1]),
+                             tf.float32),
+                         axis=-1), max_outputs=1)
 
-    loss = results_dict['mae_weighted']
+    loss = results_dict['loss']
     learning_rate_pl = tf.placeholder(tf.float32, None, 'learning_rate')
-    tf.summary.scalar('mae_weighted_loss', loss)
+    tf.summary.scalar('mse_weighted_loss', loss)
     tf.summary.scalar('learning_rate', learning_rate_pl)
     optimizer = tf.train.AdadeltaOptimizer(learning_rate=learning_rate_pl)
     optim = optimizer.minimize(loss)
@@ -269,16 +286,16 @@ def main():
     step = None
     try:
         for step in range(saved_global_step + 1, args.steps):
-            if step <= int(1e3):
-                lr = args.lr
-            elif step <= int(2e3):
-                lr = 0.8 * args.lr
-            elif step <= int(4e3):
-                lr = 0.5 * args.lr
-            elif step <= int(8e3):
-                lr = 0.25 * args.lr
-            else:
-                lr = 0.125 * args.lr
+            # if step <= int(1e3):
+            lr = args.lr
+            # elif step <= int(2e3):
+            #     lr = 0.8 * args.lr
+            # elif step <= int(4e3):
+            #     lr = 0.5 * args.lr
+            # elif step <= int(8e3):
+            #     lr = 0.25 * args.lr
+            # else:
+            #     lr = 0.125 * args.lr
             start_time = time.time()
             if step % args.ckpt_every == 0:
                 summary, loss_value, mag_spec, label_spec= sess.run([summaries, loss, predicted, batch_data[1]],
@@ -291,10 +308,12 @@ def main():
                 save_model(saver, sess, model_dir, step)
                 last_saved_step = step
                 # 没有提取mask，先听听试试
-                y = griffin_lim(mag_spec[0])
+                np.save(os.path.join(dev_dir, 'dev' + str(step) + '.npy'), mag_spec[0])
+                np.save(os.path.join(dev_dir, 'groundtruth_dev' + str(step) + '.npy'), label_spec[0])
+                y = normSTFT2wav(mag_spec[0])
                 dev_path = os.path.join(dev_dir, 'dev' + str(step) + '.wav')
                 write_wav(dev_path, y, sr=16000)
-                y = griffin_lim(label_spec[0])
+                y = normSTFT2wav(label_spec[0])
                 dev_path = os.path.join(dev_dir, 'groundtruth_dev' + str(step) + '.wav')
                 write_wav(dev_path, y, sr=16000)
             else:
@@ -308,10 +327,12 @@ def main():
                           .format(step, loss_value, duration))
                 if step % save_train_audio == 0:
                     # 没有提取mask，先听听试试
-                    y = griffin_lim(mag_spec[0])
+                    np.save(os.path.join(train_dir, 'train' + str(step) + '.npy'), mag_spec[0])
+                    np.save(os.path.join(train_dir, 'groundtruth_train' + str(step) + '.npy'), label_spec[0])
+                    y = normSTFT2wav(mag_spec[0])
                     train_path = os.path.join(train_dir, 'train' + str(step) + '.wav')
                     write_wav(train_path, y, sr=16000)
-                    y = griffin_lim(label_spec[0])
+                    y = normSTFT2wav(label_spec[0])
                     trian_path = os.path.join(train_dir, 'groundtruth_train' + str(step) + '.wav')
                     write_wav(trian_path, y, sr=16000)
 

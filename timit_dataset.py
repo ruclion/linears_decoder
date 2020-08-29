@@ -4,10 +4,10 @@ import time
 
 #生成数据的代码
 #train/test每一行都只是一个文件名
-TRAIN_FILE = 'LJSpeech-1.1/train.txt'#'/media/luhui/experiments_data/librispeech/train.txt'
-TEST_FILE = 'LJSpeech-1.1/test.txt'#'/media/luhui/experiments_data/librispeech/dev.txt'
-Linears_DIR = 'LJSpeech-1.1/linear_from_generate_batch'      #'/media/luhui/experiments_data/librispeech/mfcc_hop12.5'#生成MFCC的目录
-PPGs_DIR = 'LJSpeech-1.1/ppg_from_generate_batch'   #'/media/luhui/experiments_data/librispeech/phone_labels_hop12.5'
+TRAIN_FILE = 'LJSpeech-1.1_Norm_Sort/sorted_train.txt'#'/media/luhui/experiments_data/librispeech/train.txt'
+TEST_FILE = 'LJSpeech-1.1_Norm_Sort/sorted_test.txt'#'/media/luhui/experiments_data/librispeech/dev.txt'
+Linears_DIR = 'LJSpeech-1.1_Norm_Sort/norm_db_linear'      #'/media/luhui/experiments_data/librispeech/mfcc_hop12.5'#生成MFCC的目录
+PPGs_DIR = 'LJSpeech-1.1_Norm_Sort/norm_ppg'   #'/media/luhui/experiments_data/librispeech/phone_labels_hop12.5'
 Linear_DIM = 201
 PPG_DIM = 345
 
