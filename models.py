@@ -1,380 +1,192 @@
 import tensorflow as tf
 from tensorflow import keras
-from modules import GatedConv, CBHGLayer, PreNet
 
 
-class ConversionModelV1(object):
-    """
-    Based on Gated CNN
-    Convert PPGs + LogF0 into stft
-    """
-
-    def __init__(self, out_dim, drop_rate, is_train=True, name='vc_model1'):
-        self.out_dim = out_dim
-        self.is_train = is_train
-        self.drop_rate = drop_rate
-        self.n_gcnnlayer = 9
-        self.name = name
-
-        with tf.variable_scope(self.name, reuse=tf.AUTO_REUSE):
-            self.dropout = keras.layers.Dropout(rate=self.drop_rate,
-                                                name='dropout')
-            with tf.variable_scope('prenet'):
-                self.prenet_dense = keras.layers.Dense(units=256,
-                                                       activation=tf.nn.relu)
-        with tf.variable_scope('GatedCNN_stacks'):
-            with tf.variable_scope('GatedCNN_stack1'):
-                self.gated_cnn_stack1 = []
-                for i in range(3):
-                    gc = GatedConv(filters=256,
-                                   kernel=5,
-                                   padding='same',
-                                   name='gated_conv_{}'.format(i))
-                    self.gated_cnn_stack1.append(gc)
-                self.dense1 = keras.layers.Dense(units=512,
-                                                 activation=tf.nn.relu,
-                                                 name='dense1')
-            with tf.variable_scope('GatedCNN_stack2'):
-                self.gated_cnn_stack2 = []
-                for i in range(3):
-                    gc = GatedConv(filters=512,
-                                   kernel=5,
-                                   padding='same',
-                                   name='gated_conv_{}'.format(i))
-                    self.gated_cnn_stack2.append(gc)
-                self.dense2 = keras.layers.Dense(units=1024,
-                                                 activation=tf.nn.relu,
-                                                 name='dense2')
-            with tf.variable_scope('GatedCNN_stack3'):
-                self.gated_cnn_stack3 = []
-                for i in range(3):
-                    gc = GatedConv(filters=1024,
-                                   kernel=3,
-                                   padding='same',
-                                   name='gated_conv_{}'.format(i))
-                    self.gated_cnn_stack3.append(gc)
-            with tf.variable_scope('output_layer'):
-                self.out_dense1 = keras.layers.Dense(units=512,
-                                                     activation=tf.nn.relu,
-                                                     name='out_dense1')
-                self.out_dense2 = keras.layers.Dense(units=self.out_dim,
-                                                     name='out_dense2')
-
-    def __call__(self, inputs, lengths=None, targets=None):
-        """
-        :param inputs: [batch, time, in_dim]
-        :param lengths: [batch, ], default None, use to compute loss during training
-                        or mask out the padding part during inference part
-        :param targets: [batch, time, out_dim], used to compute loss, default None
-        :return: {'out': inference output,
-                  'loss': loss}
-        """
-        # 1. prenet
-        prenet_out = self.prenet_dense(inputs)
-        prenet_out = self.dropout(prenet_out) if self.is_train else prenet_out
-
-        # 2. GatedCNN stacks
-
-        # 2.1 GatedCNN stack 1
-        gatedcnn_stack1_out = prenet_out
-        for layer in self.gated_cnn_stack1:
-            gatedcnn_stack1_out = layer(gatedcnn_stack1_out)
-        # residual connedtion
-        gatedcnn_stack1_out += prenet_out
-        # dense + dropout
-        dense1_out = self.dense1(gatedcnn_stack1_out)
-        dense1_out = self.dropout(dense1_out) if self.is_train else dense1_out
-
-        # 2.2 GatedCNN stack 2
-        gatedcnn_stack2_out = dense1_out
-        for layer in self.gated_cnn_stack2:
-            gatedcnn_stack2_out = layer(gatedcnn_stack2_out)
-        # residual connection
-        gatedcnn_stack2_out += dense1_out
-        # dense + dropout
-        dense2_out = self.dense2(gatedcnn_stack2_out)
-        dense2_out = self.dropout(dense2_out) if self.is_train else dense2_out
-
-        # 2.3 GatedCNN stack 3
-        gatedcnn_stack3_out = dense2_out
-        for layer in self.gated_cnn_stack3:
-            gatedcnn_stack3_out = layer(gatedcnn_stack3_out)
-        # residual connection
-        gatedcnn_stack3_out += dense2_out
-
-        # 3. output
-        pre_out = self.out_dense1(gatedcnn_stack3_out)
-        outputs = self.out_dense2(pre_out)
-
-        # compute loss
-        mask = (tf.sequence_mask(lengths, maxlen=tf.reduce_max(lengths),
-                                 dtype=tf.float32)
-                if lengths is not None else 1.0)
-        seq_lengths = lengths if lengths is not None else tf.shape(inputs)[1]
-        loss = tf.reduce_mean(
-            tf.reduce_sum(
-                tf.reduce_sum(tf.square(targets - outputs), axis=-1) * mask,  # square or abs
-                axis=-1) / tf.cast(seq_lengths, tf.float32)
-        ) if targets is not None else None
-        return {'out': outputs,
-                'loss': loss}
+from modules import BLSTMlayer, CBHG, FrameProjection, MaskedMSE, MaskedLinearLoss
 
 
-class ConversionModelV2(object):
-    """ Based on CBHG
-        Convert PPGs + LogF0 into stft
-    """
-
-    def __init__(self, out_dim, drop_rate, is_train=True, name='cbhg_vc_model'):
-        self.out_dim = out_dim
-        self.is_train = is_train
-        self.drop_rate = drop_rate
+class DNNClassifier(object):
+    def __init__(self, out_dims, hiddens, drop_rate, name):
         self.name = name
         with tf.variable_scope(self.name, reuse=tf.AUTO_REUSE):
-            self.prenet = PreNet(self.is_train, hidden_units=[256, 256],
-                                 drop_rate=0.5, name='prenet')
-            self.cbhg_layer1 = CBHGLayer(n_convbank=8, bank_filters=128,
-                                         proj_filters=256, proj_kernel=3,
-                                         n_highwaylayer=4, highway_out_dim=256,
-                                         gru_hidden=128, name='cbhg_1')
-            # out 256 dim
-            self.cbhg_layer2 = CBHGLayer(n_convbank=8, bank_filters=128,
-                                         proj_filters=256, proj_kernel=3,
-                                         n_highwaylayer=4, highway_out_dim=256,
-                                         gru_hidden=128, name='cbhg_2')
-            # out 256 dim
-            self.out_dense1 = keras.layers.Dense(units=128,
-                                                 activation=tf.nn.relu,
-                                                 name='out_dense1')
-            self.out_dense2 = keras.layers.Dense(units=self.out_dim,
-                                                 name='out_dense2')
-
-    def __call__(self, inputs, lengths=None, targets=None):
-        x = inputs
-        prenet_out = self.prenet(x)
-        cbhg1_out = self.cbhg_layer1(prenet_out, seq_lens=lengths)
-        cbhg2_out = self.cbhg_layer2(cbhg1_out, seq_lens=lengths)
-        pre_out = self.out_dense1(cbhg2_out)
-        outputs = self.out_dense2(pre_out)
-        # compute loss
-        mask = (tf.sequence_mask(lengths, maxlen=tf.reduce_max(lengths),
-                                 dtype=tf.float32)
-                if lengths is not None else 1.0)
-        seq_lengths = lengths if lengths is not None else tf.shape(inputs)[1]
-        loss = tf.reduce_mean(
-            tf.reduce_sum(
-                tf.reduce_mean(tf.square(targets - outputs), axis=-1) * mask,
-                axis=-1) / tf.cast(seq_lengths, tf.float32)
-        ) if targets is not None else None
-        return {'out': outputs,
-                'loss': loss}
-
-
-class ConversionModelV3(object):
-    """ Based on CBHG
-        Convert PPGs + LogF0 into stft
-    """
-
-    def __init__(self, out_dim, drop_rate, is_train=True, name='cbhg_vc_model'):
-        self.out_dim = out_dim
-        self.is_train = is_train
-        self.drop_rate = drop_rate
-        self.name = name
-        with tf.variable_scope(self.name, reuse=tf.AUTO_REUSE):
-            self.prenet = PreNet(self.is_train, hidden_units=[384, 384],
-                                 drop_rate=0.5, name='prenet')
-            self.cbhg_layer = CBHGLayer(n_convbank=8, bank_filters=128,
-                                        proj_filters=384, proj_kernel=3,
-                                        n_highwaylayer=4, highway_out_dim=384,
-                                        gru_hidden=256, name='cbhg_1')
-            # out 512 dim
-            self.out_dense1 = keras.layers.Dense(units=256,
-                                                 activation=tf.nn.relu,
-                                                 name='out_dense1')
-            self.out_dense2 = keras.layers.Dense(units=self.out_dim,
-                                                 name='out_dense2')
-
-    def __call__(self, inputs, lengths=None, targets=None):
-        x = inputs
-        prenet_out = self.prenet(x)
-        cbhg1_out = self.cbhg_layer(prenet_out, seq_lens=lengths)
-        pre_out = self.out_dense1(cbhg1_out)
-        outputs = self.out_dense2(pre_out)
-        # compute loss
-        mask = (tf.sequence_mask(lengths, maxlen=tf.reduce_max(lengths),
-                                 dtype=tf.float32)
-                if lengths is not None else 1.0)
-        seq_lengths = lengths if lengths is not None else tf.shape(inputs)[1]
-        loss = tf.reduce_mean(
-            tf.reduce_sum(
-                tf.reduce_mean(tf.square(targets - outputs), axis=-1) * mask,
-                axis=-1) / tf.cast(seq_lengths, tf.float32)
-        ) if targets is not None else None
-        return {'out': outputs,
-                'loss': loss}
-
-
-class ConversionModelV4(object):
-    """ Based on BLSTM
-        Convert PPGs + LogF0 into Mels
-    """
-
-    def __init__(self, lstm_hidden, proj_dim, out_dim, name='blstm_model'):
-        self.name = name
-        with tf.variable_scope(self.name, reuse=tf.AUTO_REUSE):
-            self.in_projection = keras.layers.Dense(units=proj_dim, activation=tf.nn.tanh)
-            self.lstm_layer1 = keras.layers.LSTM(units=lstm_hidden, return_sequences=True)
-            self.projection1 = keras.layers.Dense(units=proj_dim, activation=tf.nn.tanh)
-            self.lstm_layer2 = keras.layers.LSTM(units=lstm_hidden, return_sequences=True)
-            self.projection2 = keras.layers.Dense(units=proj_dim, activation=tf.nn.relu)
-            self.out_projection = keras.layers.Dense(units=out_dim)
-
-    def __call__(self, inputs, lengths=None, targets=None):
-        x = inputs
-        in_projection = self.in_projection(x)
-        blstm1_out = self.lstm_layer1(in_projection)
-        projection1 = self.projection1(blstm1_out)
-        blstm2_out = self.lstm_layer2(projection1)
-        projection2 = self.projection2(blstm2_out)
-        outputs = self.out_projection(projection2)
-        # compute loss
-        mask = (tf.sequence_mask(lengths, maxlen=tf.reduce_max(lengths),
-                                 dtype=tf.float32)
-                if lengths is not None else 1.0)
-        seq_lengths = lengths if lengths is not None else tf.shape(inputs)[1]
-        loss = tf.reduce_mean(
-            tf.reduce_sum(
-                tf.reduce_mean(tf.square(targets - outputs), axis=-1) * mask,
-                axis=-1) / tf.cast(seq_lengths, tf.float32)
-        ) if targets is not None else None
-        return {'out': outputs,
-                'loss': loss}
-
-
-class ConversionModelV5(object):
-    """ Based on BLSTM
-        Convert PPGs + LogF0 into Mels
-    """
-
-    def __init__(self, lstm_hidden, proj_dim, out_dim, drop_rate, name='blstm_model'):
-        self.name = name
-        with tf.variable_scope(self.name, reuse=tf.AUTO_REUSE):
-            self.in_projection = keras.layers.Dense(units=proj_dim, activation=tf.nn.tanh)
-            self.lstm_layer1 = keras.layers.LSTM(units=lstm_hidden, return_sequences=True)
-            self.projection1 = keras.layers.Dense(units=proj_dim, activation=tf.nn.tanh)
-            self.lstm_layer2 = keras.layers.LSTM(units=lstm_hidden, return_sequences=True)
-            self.projection2 = keras.layers.Dense(units=proj_dim, activation=tf.nn.relu)
-            self.out_projection = keras.layers.Dense(units=out_dim)
-            self.dropout_layer = keras.layers.Dropout(drop_rate)
-
-    def __call__(self, inputs, lengths=None, targets=None):
-        x = inputs
-        in_projection = self.dropout_layer(self.in_projection(x))
-        blstm1_out = self.lstm_layer1(in_projection)
-        projection1 = self.dropout_layer(self.projection1(blstm1_out))
-        blstm2_out = self.lstm_layer2(projection1)
-        projection2 = self.dropout_layer(self.projection2(blstm2_out))
-        outputs = self.out_projection(projection2)
-        # compute loss
-        mask = (tf.sequence_mask(lengths, maxlen=tf.reduce_max(lengths),
-                                 dtype=tf.float32)
-                if lengths is not None else 1.0)
-        seq_lengths = lengths if lengths is not None else tf.shape(inputs)[1]
-        loss = tf.reduce_mean(
-            tf.reduce_sum(
-                tf.reduce_mean(tf.square(targets - outputs), axis=-1) * mask,
-                axis=-1) / tf.cast(seq_lengths, tf.float32)
-        ) if targets is not None else None
-        return {'out': outputs,
-                'loss': loss}
-
-
-class ConversionModelV6(object):
-    """ Based on CBHG
-        Convert PPGs + LogF0 into stft
-    """
-
-    def __init__(self, out_dim, drop_rate, is_train=True, name='cbhg_vc_model'):
-        self.out_dim = out_dim
-        self.is_train = is_train
-        self.name = name
-        with tf.variable_scope(self.name, reuse=tf.AUTO_REUSE):
-            self.prenet = PreNet(self.is_train, hidden_units=[384, 384],
-                                 drop_rate=0.5, name='prenet')
-            self.cbhg_layer = CBHGLayer(n_convbank=8, bank_filters=128,
-                                        proj_filters=384, proj_kernel=3,
-                                        n_highwaylayer=4, highway_out_dim=384,
-                                        gru_hidden=256, name='cbhg_1')
-            # out 512 dim
-            self.out_dense1 = keras.layers.Conv1D(filters=256, kernel_size=3,
-                                                  activation=tf.nn.tanh,
-                                                  padding='SAME',
-                                                  name='out_conv1')
+            self.dense_layers = []
+            for i, units in enumerate(hiddens):
+                dense = keras.layers.Dense(units, activation=tf.nn.sigmoid,
+                                           name='dense{}'.format(i))
+                self.dense_layers.append(dense)
             self.dropout_layer = keras.layers.Dropout(rate=drop_rate)
-            self.out_dense2 = keras.layers.Dense(units=self.out_dim,
-                                                 activation=None,
-                                                 name='out_dense2')
+            self.output_dense = keras.layers.Dense(units=out_dims)
 
-    def __call__(self, inputs, lengths=None, targets=None):
-        x = inputs
-        prenet_out = self.prenet(x)
-        cbhg1_out = self.cbhg_layer(prenet_out, seq_lens=lengths)
-        pre_out = self.out_dense1(cbhg1_out)
-        pre_out = self.dropout_layer(pre_out)
-        outputs = self.out_dense2(pre_out)
-        # compute loss
-        mask = (tf.sequence_mask(lengths, maxlen=tf.reduce_max(lengths),
-                                 dtype=tf.float32)
-                if lengths is not None else 1.0)
-        seq_lengths = lengths if lengths is not None else tf.shape(inputs)[1]
-        loss = tf.reduce_mean(
-            tf.reduce_sum(
-                tf.reduce_mean(tf.abs(targets - outputs), axis=-1) * mask,
-                axis=-1) / tf.cast(seq_lengths, tf.float32)
-        ) if targets is not None else None
-        return {'out': outputs,
-                'loss': loss}
+    def __call__(self, inputs, use_dropout=True, labels=None, lengths=None):
+        """
+        :param inputs: [batch, time, in_dims]
+        :param labels: [batch, time, out_dims], should be one-hot
+        :param lengths: [batch]
+        :return:
+        """
+        cur_layer = inputs
+        for layer in self.dense_layers:
+            cur_layer = layer(cur_layer)
+            cur_layer = tf.cond(tf.constant(use_dropout, dtype=tf.bool),
+                                lambda: self.dropout_layer(cur_layer),
+                                lambda: cur_layer)
+        logits = self.output_dense(cur_layer)  # [batch, time, out_dims]
+        cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            labels=tf.argmax(labels, axis=-1),
+            logits=logits) if labels is not None else None
+        mask = tf.sequence_mask(lengths, dtype=tf.float32) if lengths is not None else 1.0
+        cross_entropy = tf.reduce_mean(cross_entropy * mask) if cross_entropy is not None else None
+        return {'logits': logits,  # [time, dims]
+                'cross_entropy': cross_entropy}
 
 
-class ConversionModelV7(object):
-    """ Based on CBHG
-        Convert PPGs + LogF0 into stft
-    """
-
-    def __init__(self, out_dim, drop_rate, is_train=True, name='cbhg_vc_model'):
-        self.out_dim = out_dim
-        self.is_train = is_train
-        self.drop_rate = drop_rate
+class CnnDnnClassifier(object):
+    def __init__(self, out_dims, n_cnn, cnn_hidden, dense_hiddens,
+                 name='cnn_dnn_classifier'):
         self.name = name
         with tf.variable_scope(self.name, reuse=tf.AUTO_REUSE):
-            self.prenet = PreNet(self.is_train, hidden_units=[384, 384],
-                                 drop_rate=0.5, name='prenet')
-            self.cbhg_layer = CBHGLayer(n_convbank=8, bank_filters=128,
-                                        proj_filters=384, proj_kernel=3,
-                                        n_highwaylayer=4, highway_out_dim=384,
-                                        gru_hidden=256, name='cbhg_1')
-            # out 512 dim
-            self.out_dense1 = keras.layers.Dense(units=256,
-                                                 activation=tf.nn.relu,
-                                                 name='out_dense1')
-            self.out_dense2 = keras.layers.Dense(units=self.out_dim,
-                                                 name='out_dense2')
+            with tf.variable_scope('multi_scale_cnn'):
+                self.conv_stack = []
+                for i in range(n_cnn):
+                    cnn_layer = keras.layers.Conv1D(filters=cnn_hidden,
+                                                    kernel_size=i + 1,
+                                                    padding='same',
+                                                    name='cnn{}'.format(i + 1))
+                    self.conv_stack.append(cnn_layer)
+            self.pooling_layer = keras.layers.MaxPool1D(pool_size=2, strides=1,
+                                                        padding='same')
+            with tf.variable_scope('dnn_layers'):
+                self.dense_layers = []
+                for i, hidden in enumerate(dense_hiddens):
+                    dense_layer = keras.layers.Dense(units=hidden,
+                                                     activation=tf.nn.sigmoid,
+                                                     name='dense{}'.format(i))
+                    self.dense_layers.append(dense_layer)
+            self.output_layer = keras.layers.Dense(units=out_dims, activation=None,
+                                                   name='output_dense')
 
-    def __call__(self, inputs, lengths=None, targets=None):
-        x = inputs
-        prenet_out = self.prenet(x)
-        cbhg1_out = self.cbhg_layer(prenet_out, seq_lens=lengths)
-        pre_out = self.out_dense1(cbhg1_out)
-        outputs = self.out_dense2(pre_out)
+    def __call__(self, inputs, labels=None, lengths=None):
+        # 1. conv1d stack
+        cnn_stack_outs = tf.concat([conv_layer(inputs) for conv_layer in self.conv_stack],
+                                   axis=-1)
+        # 2. maxpooling over time
+        maxpool_outs = self.pooling_layer(cnn_stack_outs)
+
+        # 3. DNN stack
+        dnn_outs = maxpool_outs
+        for dense in self.dense_layers:
+            dnn_outs = dense(dnn_outs)
+
+        # 4. output layer
+        logits = self.output_layer(dnn_outs)
+
         # compute loss
-        mask = (tf.sequence_mask(lengths, maxlen=tf.reduce_max(lengths),
-                                 dtype=tf.float32)
-                if lengths is not None else 1.0)
-        seq_lengths = lengths if lengths is not None else tf.shape(inputs)[1]
-        loss = tf.reduce_mean(
-            tf.reduce_sum(
-                tf.reduce_mean(tf.square(targets - outputs), axis=-1) * mask,
-                axis=-1) / tf.cast(seq_lengths, tf.float32)
-        ) if targets is not None else None
-        return {'out': outputs,
-                'loss': loss}
+        cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            labels=tf.argmax(labels, axis=-1),
+            logits=logits) if labels is not None else None
+        mask = tf.sequence_mask(lengths, dtype=tf.float32) if lengths is not None else 1.0
+        cross_entropy = tf.reduce_mean(cross_entropy * mask) if cross_entropy is not None else None
+        return {'logits': logits,  # [time, dims]
+                'cross_entropy': cross_entropy}
+
+
+class CNNBLSTMCalssifier(object):
+    def __init__(self, out_dims, n_cnn, cnn_hidden,
+                 cnn_kernel, n_blstm, lstm_hidden,
+                 name='cnn_blstm_classifier'):
+        self.name = name
+        with tf.variable_scope(self.name):
+            self.cnn_layers = []
+            for i in range(n_cnn):
+                conv_layer = keras.layers.Conv1D(filters=cnn_hidden,
+                                                 kernel_size=cnn_kernel,
+                                                 strides=1, padding='same',
+                                                 activation=tf.nn.relu,
+                                                 name='conv_layer{}'.format(i))
+                self.cnn_layers.append(conv_layer)
+            self.blstm_layers = []
+            for i in range(n_blstm):
+                blstm_layer = BLSTMlayer(lstm_hidden,
+                                         name='blstm_layer{}'.format(i))
+                self.blstm_layers.append(blstm_layer)
+            self.output_projection = keras.layers.Dense(units=out_dims)
+
+    def __call__(self, inputs, labels=None, lengths=None):
+        # 1. CNN block
+        cnn_outs = inputs
+        for layer in self.cnn_layers:
+            cnn_outs = layer(cnn_outs)
+        # 2. BLSTM layers
+        blstm_outs = cnn_outs
+        for layer in self.blstm_layers:
+            blstm_outs = layer(blstm_outs, seq_lens=lengths)
+        # 3. output projection
+        logits = self.output_projection(blstm_outs)
+
+        # 4. compute loss
+        cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            labels=tf.argmax(labels, axis=-1),
+            logits=logits) if labels is not None else None
+        mask = tf.sequence_mask(lengths, dtype=tf.float32) if lengths is not None else 1.0
+        cross_entropy = tf.reduce_mean(cross_entropy * mask) if cross_entropy is not None else None
+        return {'logits': logits,  # [time, dims]
+                'cross_entropy': cross_entropy}
+
+class AcousticCBHGRegression(object):#使用这个
+    def __init__(self, hp,
+                 name='acoustic_CBHG_regression'):
+        self.name = name
+        self.hp = hp
+        with tf.variable_scope(self.name):
+            # Add post-processing CBHG. This does a great job at extracting features from mels before projection to Linear specs.
+            self.post_cbhg = CBHG(hp.cbhg_kernels, hp.cbhg_conv_channels, hp.cbhg_pool_size, [hp.cbhg_projection, hp.num_ppgs],
+                hp.cbhg_projection_kernel_size, hp.cbhg_highwaynet_layers,
+                hp.cbhg_highway_units, hp.cbhg_rnn_units, hp.batch_norm_position, hp.is_training, name='CBHG_postnet')
+
+            
+
+            #Linear projection of extracted features to make linear spectrogram
+            self.linear_specs_projection = FrameProjection(hp.num_freq, scope='cbhg_linear_specs_projection')
+            # self.cnn_layers = []
+            # for i in range(n_cnn):
+            #     conv_layer = keras.layers.Conv1D(filters=cnn_hidden,
+            #                                      kernel_size=cnn_kernel,
+            #                                      strides=1, padding='same',
+            #                                      activation=tf.nn.relu,
+            #                                      name='conv_layer{}'.format(i))
+            #     self.cnn_layers.append(conv_layer)
+            # self.blstm_layers = []
+            # for i in range(n_blstm):
+            #     blstm_layer = BLSTMlayer(lstm_hidden,
+            #                              name='blstm_layer{}'.format(i))
+            #     self.blstm_layers.append(blstm_layer)
+            # self.output_projection = keras.layers.Dense(units=out_dims)
+
+    def __call__(self, inputs, labels=None, lengths=None):
+        #[batch_size, decoder_steps(mel_frames), cbhg_channels]
+        post_outputs = self.post_cbhg(inputs, None)
+        #[batch_size, decoder_steps(linear_frames), num_freq]
+        linear_outputs = self.linear_specs_projection(post_outputs)
+
+        # # 1. CNN block
+        # cnn_outs = inputs
+        # for layer in self.cnn_layers:
+        #     cnn_outs = layer(cnn_outs)
+        # # 2. BLSTM layers
+        # blstm_outs = cnn_outs
+        # for layer in self.blstm_layers:
+        #     blstm_outs = layer(blstm_outs, seq_lens=lengths)
+        # # 3. output projection
+        # logits = self.output_projection(blstm_outs)
+
+        # 4. compute loss
+        # mse = tf.nn.sparse_softmax_cross_entropy_with_logits(
+        #     labels=tf.argmax(labels, axis=-1),
+        #     logits=logits) if labels is not None else None
+        # 并且在MaskedLinearLoss中，可能更好
+        # mse = MaskedMSE(labels, linear_outputs, lengths, self.hp) # 注意label和预测值顺序，注意lengths是1维浮点数
+        mae_weighted = MaskedLinearLoss(labels, linear_outputs, lengths, self.hp) # 注意label和预测值顺序，注意lengths是1维浮点数
+        # mask = tf.sequence_mask(lengths, dtype=tf.float32) if lengths is not None else 1.0
+        # cross_entropy = tf.reduce_mean(cross_entropy * mask) if cross_entropy is not None else None
+        return {'out': linear_outputs,  # [time, dims]
+                'loss': mae_weighted}

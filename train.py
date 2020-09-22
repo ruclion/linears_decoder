@@ -11,7 +11,7 @@ import numpy as np
 os.environ["CUDA_VISIBLE_DEVICES"]="2"#2
 
 # from models import CnnDnnClassifier, DNNClassifier, CNNBLSTMCalssifier
-from models import ConversionModelV3
+from models import AcousticCBHGRegression
 from timit_dataset import train_generator, test_generator
 from audio import log_power_denormalize, db2power, griffin_lim, write_wav 
 #
@@ -48,18 +48,18 @@ def normSTFT2wav(spec):
  # 记得预测的时候，batch为1，把is_training关掉
 my_hp = tf.contrib.training.HParams(
     #CBHG mel->linear postnet
-    # cbhg_kernels = 8, #All kernel sizes from 1 to cbhg_kernels will be used in the convolution bank of CBHG to act as "K-grams"
-    # cbhg_conv_channels = 128, #Channels of the convolution bank
-    # cbhg_pool_size = 2, #pooling size of the CBHG
-    # cbhg_projection = 256, #projection channels of the CBHG (1st projection, 2nd is automatically set to num_mels)
+    cbhg_kernels = 8, #All kernel sizes from 1 to cbhg_kernels will be used in the convolution bank of CBHG to act as "K-grams"
+    cbhg_conv_channels = 128, #Channels of the convolution bank
+    cbhg_pool_size = 2, #pooling size of the CBHG
+    cbhg_projection = 256, #projection channels of the CBHG (1st projection, 2nd is automatically set to num_mels)
     num_ppgs = 345,
-    # cbhg_projection_kernel_size = 3, #kernel_size of the CBHG projections
-    # cbhg_highwaynet_layers = 4, #Number of HighwayNet layers
-    # cbhg_highway_units = 128, #Number of units used in HighwayNet fully connected layers
-    # cbhg_rnn_units = 128, #Number of GRU units used in bidirectional RNN of CBHG block. CBHG output is 2x rnn_units in shape
-    # outputs_per_step = 1,
-    # batch_norm_position = 'after', #Can be in ('before', 'after'). Determines whether we use batch norm before or after the activation function (relu). Matter for debate.
-    # is_training = 1,
+    cbhg_projection_kernel_size = 3, #kernel_size of the CBHG projections
+    cbhg_highwaynet_layers = 4, #Number of HighwayNet layers
+    cbhg_highway_units = 128, #Number of units used in HighwayNet fully connected layers
+    cbhg_rnn_units = 128, #Number of GRU units used in bidirectional RNN of CBHG block. CBHG output is 2x rnn_units in shape
+    outputs_per_step = 1,
+    batch_norm_position = 'after', #Can be in ('before', 'after'). Determines whether we use batch norm before or after the activation function (relu). Matter for debate.
+    is_training = 1,
     num_freq = 201,
     sample_rate = 16000,
 )
@@ -209,9 +209,9 @@ def main():
     #                               cnn_hidden=64, dense_hiddens=[256, 256, 256])
 
 
-    decoderRegression = ConversionModelV3(out_dim=my_hp.num_freq, drop_rate=DROP_RATE, is_train=True)
+    decoderRegression = AcousticCBHGRegression(my_hp)
 
-    results_dict = decoderRegression(inputs=batch_data[0], targets=batch_data[1], lengths=batch_data[2])
+    results_dict = decoderRegression(inputs=batch_data[0], labels=batch_data[1], lengths=batch_data[2])
     #inputs labels lengths
     #results_dict['logits']= np.zeros([10])
     predicted = results_dict['out']
